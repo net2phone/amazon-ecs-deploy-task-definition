@@ -8,6 +8,39 @@ const crypto = require('crypto');
 const MAX_WAIT_MINUTES = 360;  // 6 hours
 const WAIT_DEFAULT_DELAY_SEC = 15;
 
+// Retry wrapper for AWS SDK calls to handle rate limiting
+async function retryAwsCall(fn, retryAttempts = 3, retryDelay = 1) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= retryAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      // Check if error is rate limit related
+      const isRateLimit = error.name === 'ThrottlingException' || 
+                         error.name === 'Throttling' ||
+                         error.name === 'TooManyRequestsException' ||
+                         error.name === 'RequestLimitExceeded' ||
+                         (error.message && error.message.includes('Rate exceeded')) ||
+                         (error.message && error.message.includes('throttling')) ||
+                         (error.message && error.message.includes('rate limit'));
+      
+      if (!isRateLimit || attempt === retryAttempts) {
+        throw error;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = retryDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+      core.info(`Rate limit detected, retrying in ${delay.toFixed(0)}ms (attempt ${attempt}/${retryAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw lastError;
+}
+
 // Attributes that are returned by DescribeTaskDefinition, but are not valid RegisterTaskDefinition inputs
 const IGNORED_TASK_DEFINITION_ATTRIBUTES = [
   'compatibilities',
@@ -21,7 +54,7 @@ const IGNORED_TASK_DEFINITION_ATTRIBUTES = [
 ];
 
 // Method to run a stand-alone task with desired inputs
-async function runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSManagedTags) {
+async function runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSManagedTags, retryAttempts = 3, retryDelay = 1) {
   core.info('Running task')
 
   const waitForTask = core.getInput('wait-for-task-stopped', { required: false }) || 'false';
@@ -64,20 +97,24 @@ async function runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSMa
     }
   }
 
-  const runTaskResponse = await ecs.runTask({
-    startedBy: startedBy,
-    cluster: clusterName,
-    taskDefinition: taskDefArn,
-    overrides: {
-      containerOverrides: containerOverrides
-    },
-    capacityProviderStrategy: capacityProviderStrategy.length === 0 ? null : capacityProviderStrategy,
-    launchType: capacityProviderStrategy.length === 0 ? launchType : null,
-    networkConfiguration: Object.keys(awsvpcConfiguration).length === 0 ? null : { awsvpcConfiguration: awsvpcConfiguration },
-    enableECSManagedTags: enableECSManagedTags,
-    tags: tags,
-    volumeConfigurations: volumeConfigurations
-  });
+  const runTaskResponse = await retryAwsCall(
+    () => ecs.runTask({
+      startedBy: startedBy,
+      cluster: clusterName,
+      taskDefinition: taskDefArn,
+      overrides: {
+        containerOverrides: containerOverrides
+      },
+      capacityProviderStrategy: capacityProviderStrategy.length === 0 ? null : capacityProviderStrategy,
+      launchType: capacityProviderStrategy.length === 0 ? launchType : null,
+      networkConfiguration: Object.keys(awsvpcConfiguration).length === 0 ? null : { awsvpcConfiguration: awsvpcConfiguration },
+      enableECSManagedTags: enableECSManagedTags,
+      tags: tags,
+      volumeConfigurations: volumeConfigurations
+    }),
+    retryAttempts,
+    retryDelay * 1000
+  );
 
   core.debug(`Run task response ${JSON.stringify(runTaskResponse)}`)
 
@@ -97,7 +134,7 @@ async function runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSMa
   // Wait for task to end
   if (waitForTask && waitForTask.toLowerCase() === "true") {
     await waitForTasksStopped(ecs, clusterName, taskArns, waitForMinutes)
-    await tasksExitCode(ecs, clusterName, taskArns)
+    await tasksExitCode(ecs, clusterName, taskArns, retryAttempts, retryDelay)
   } else {
     core.debug('Not waiting for the task to stop');
   }
@@ -166,11 +203,15 @@ async function waitForTasksStopped(ecs, clusterName, taskArns, waitForMinutes) {
 }
 
 // Check a task's exit code and fail the job on error
-async function tasksExitCode(ecs, clusterName, taskArns) {
-  const describeResponse = await ecs.describeTasks({
-    cluster: clusterName,
-    tasks: taskArns
-  });
+async function tasksExitCode(ecs, clusterName, taskArns, retryAttempts = 3, retryDelay = 1) {
+  const describeResponse = await retryAwsCall(
+    () => ecs.describeTasks({
+      cluster: clusterName,
+      tasks: taskArns
+    }),
+    retryAttempts,
+    retryDelay * 1000
+  );
 
   const containers = [].concat(...describeResponse.tasks.map(task => task.containers))
   const exitCodes = containers.map(container => container.exitCode)
@@ -191,7 +232,7 @@ async function tasksExitCode(ecs, clusterName, taskArns) {
 }
 
 // Deploy to a service that uses the 'ECS' deployment controller
-async function updateEcsService(ecs, clusterName, service, taskDefArn, waitForService, waitForMinutes, forceNewDeployment, desiredCount, enableECSManagedTags, propagateTags) {
+async function updateEcsService(ecs, clusterName, service, taskDefArn, waitForService, waitForMinutes, forceNewDeployment, desiredCount, enableECSManagedTags, propagateTags, retryAttempts = 3, retryDelay = 1) {
   core.debug('Updating the service');
 
   const serviceManagedEBSVolumeName = core.getInput('service-managed-ebs-volume-name', { required: false }) || '';
@@ -226,7 +267,11 @@ async function updateEcsService(ecs, clusterName, service, taskDefArn, waitForSe
   if (!isNaN(desiredCount) && desiredCount !== undefined) {
     params.desiredCount = desiredCount;
   }
-  await ecs.updateService(params);
+  await retryAwsCall(
+    () => ecs.updateService(params),
+    retryAttempts,
+    retryDelay * 1000
+  );
 
   const region = await ecs.config.region();
   const consoleHostname = region.startsWith('cn') ? 'console.amazonaws.cn' : 'console.aws.amazon.com';
@@ -361,7 +406,7 @@ function validateProxyConfigurations(taskDef){
 }
 
 // Deploy to a service that uses the 'CODE_DEPLOY' deployment controller
-async function createCodeDeployDeployment(codedeploy, clusterName, service, taskDefArn, waitForService, waitForMinutes) {
+async function createCodeDeployDeployment(codedeploy, clusterName, service, taskDefArn, waitForService, waitForMinutes, retryAttempts = 3, retryDelay = 1) {
   core.debug('Updating AppSpec file with new task definition ARN');
 
   let codeDeployAppSpecFile = core.getInput('codedeploy-appspec', { required : false });
@@ -377,10 +422,14 @@ async function createCodeDeployDeployment(codedeploy, clusterName, service, task
 
   let codeDeployConfig = core.getInput('codedeploy-deployment-config', { required: false });
 
-  let deploymentGroupDetails = await codedeploy.getDeploymentGroup({
-    applicationName: codeDeployApp,
-    deploymentGroupName: codeDeployGroup
-  });
+  let deploymentGroupDetails = await retryAwsCall(
+    () => codedeploy.getDeploymentGroup({
+      applicationName: codeDeployApp,
+      deploymentGroupName: codeDeployGroup
+    }),
+    retryAttempts,
+    retryDelay * 1000
+  );
   deploymentGroupDetails = deploymentGroupDetails.deploymentGroupInfo;
 
   // Insert the task def ARN into the appspec file
@@ -424,7 +473,11 @@ async function createCodeDeployDeployment(codedeploy, clusterName, service, task
   if (codeDeployConfig) {
     deploymentParams.deploymentConfigName = codeDeployConfig
   }
-  const createDeployResponse = await codedeploy.createDeployment(deploymentParams);
+  const createDeployResponse = await retryAwsCall(
+    () => codedeploy.createDeployment(deploymentParams),
+    retryAttempts,
+    retryDelay * 1000
+  );
   core.setOutput('codedeploy-deployment-id', createDeployResponse.deploymentId);
 
   const region = await codedeploy.config.region();
@@ -467,6 +520,8 @@ async function run() {
     const cluster = core.getInput('cluster', { required: false });
     const waitForService = core.getInput('wait-for-service-stability', { required: false });
     let waitForMinutes = parseInt(core.getInput('wait-for-minutes', { required: false })) || 30;
+    const retryAttempts = parseInt(core.getInput('retry-attempts', { required: false })) || 3;
+    const retryDelay = parseInt(core.getInput('retry-delay', { required: false })) || 1;
 
     if (waitForMinutes > MAX_WAIT_MINUTES) {
       waitForMinutes = MAX_WAIT_MINUTES;
@@ -495,7 +550,11 @@ async function run() {
     const taskDefContents = maintainValidObjects(removeIgnoredAttributes(cleanNullKeys(yaml.parse(fileContents))));
     let registerResponse;
     try {
-      registerResponse = await ecs.registerTaskDefinition(taskDefContents);
+      registerResponse = await retryAwsCall(
+        () => ecs.registerTaskDefinition(taskDefContents),
+        retryAttempts,
+        retryDelay * 1000
+      );
     } catch (error) {
       core.setFailed("Failed to register task definition in ECS: " + error.message);
       core.debug("Task definition contents:");
@@ -512,16 +571,20 @@ async function run() {
     core.debug(`shouldRunTask: ${shouldRunTask}`);
     if (shouldRunTask) {
       core.debug("Running ad-hoc task...");
-      await runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSManagedTags);
+      await runTask(ecs, clusterName, taskDefArn, waitForMinutes, enableECSManagedTags, retryAttempts, retryDelay);
     }
 
     // Update the service with the new task definition
     if (service) {
       // Determine the deployment controller
-      const describeResponse = await ecs.describeServices({
-        services: [service],
-        cluster: clusterName
-      });
+      const describeResponse = await retryAwsCall(
+        () => ecs.describeServices({
+          services: [service],
+          cluster: clusterName
+        }),
+        retryAttempts,
+        retryDelay * 1000
+      );
 
       if (describeResponse.failures && describeResponse.failures.length > 0) {
         const failure = describeResponse.failures[0];
@@ -536,12 +599,12 @@ async function run() {
       if (!serviceResponse.deploymentController || !serviceResponse.deploymentController.type || serviceResponse.deploymentController.type === 'ECS') {
         // Service uses the 'ECS' deployment controller, so we can call UpdateService
         core.debug('Updating service...');
-        await updateEcsService(ecs, clusterName, service, taskDefArn, waitForService, waitForMinutes, forceNewDeployment, desiredCount, enableECSManagedTags, propagateTags);
+        await updateEcsService(ecs, clusterName, service, taskDefArn, waitForService, waitForMinutes, forceNewDeployment, desiredCount, enableECSManagedTags, propagateTags, retryAttempts, retryDelay);
 
       } else if (serviceResponse.deploymentController.type === 'CODE_DEPLOY') {
         // Service uses CodeDeploy, so we should start a CodeDeploy deployment
         core.debug('Deploying service in the default cluster');
-        await createCodeDeployDeployment(codedeploy, clusterName, service, taskDefArn, waitForService, waitForMinutes);
+        await createCodeDeployDeployment(codedeploy, clusterName, service, taskDefArn, waitForService, waitForMinutes, retryAttempts, retryDelay);
       } else {
         throw new Error(`Unsupported deployment controller: ${serviceResponse.deploymentController.type}`);
       }
